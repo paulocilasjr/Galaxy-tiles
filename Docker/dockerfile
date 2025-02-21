@@ -1,0 +1,33 @@
+FROM python:3.9-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libopenslide-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    libpng-dev \
+    libtiff-dev \
+    libopenjp2-7-dev \
+    libfreetype6-dev \
+    liblcms2-dev \
+    libwebp-dev \
+    tcl8.6-dev \
+    tk8.6-dev \
+    python3-tk \
+    libopencv-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+COPY ../tools/tiling_pyhist.py /app/
+COPY ../tools/test-data/TCGA-B6-A0WY-01Z-00-DX1.FA103E02-3BDC-47DC-BA6E-59FCC58866D1.svs /app/test-data/
+RUN pip install --no-cache-dir \
+    pyhist \
+    pillow \
+    opencv-python-headless \
+    openslide-python
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["python", "tiling_pyhist.py"]
+CMD ["--zip_file", "/app/test-data/TCGA-B6-A0WY-01Z-00-DX1.FA103E02-3BDC-47DC-BA6E-59FCC58866D1.svs", \
+     "--output_zip", "/output/output.zip", \
+     "--patch-size", "256", \
+     "--content-threshold", "0.05", \
+     "--output-downsample", "16"]

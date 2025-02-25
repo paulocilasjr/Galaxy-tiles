@@ -4,9 +4,8 @@ import tempfile
 import subprocess
 import shutil
 from pathlib import Path
-
-# Configure logging
 import logging
+
 logging.basicConfig(
     filename="tile_processing.log",
     filemode="a",
@@ -14,41 +13,40 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-VALID_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.svs'}
+VALID_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.svs', '.dat'}
+
 
 def extract_zip(zip_file):
-    """Extracts a ZIP file into a temporary directory."""
     temp_dir = tempfile.mkdtemp(prefix="zip_extract_")
     try:
         with zipfile.ZipFile(zip_file, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
-            file_list = [os.path.join(temp_dir, f) for f in zip_ref.namelist()]
-        logging.info(f"ZIP file extracted to: {temp_dir}")
+            file_list = [str(Path(temp_dir) / f) for f in zip_ref.namelist()]
+        logging.info("ZIP file extracted to: %s", temp_dir)
         return temp_dir, file_list
     except zipfile.BadZipFile as exc:
         raise RuntimeError("Invalid ZIP file.") from exc
 
-def pull_podman_image():
-    """Pulls the mmunozag/pyhist Podman image if not already present."""
+
+def pull_docker_image():
     try:
-        subprocess.run(["podman", "pull", "mmunozag/pyhist"], check=True, capture_output=True, text=True)
-        logging.info("Pulled Podman image: mmunozag/pyhist")
+        subprocess.run(["docker", "pull", "mmunozag/pyhist"],
+                       check=True, capture_output=True, text=True)
+        logging.info("Pulled docker image: mmunozag/pyhist")
     except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to pull Podman image: {e.stderr}")
-        raise RuntimeError(f"Failed to pull mmunozag/pyhist: {e.stderr}") from e
+        logging.error("Failed to pull docker image: %s", e.stderr)
+        raise RuntimeError("Failed to pull mmunozag/pyhist: %s" % e.stderr) from e
 
-def run_pyhist_podman(image_path):
-    """Runs PyHIST via Podman on the given image with specific parameters."""
-    image_path = os.path.abspath(image_path)
-    image_name = os.path.splitext(os.path.basename(image_path))[0]
-    ext = os.path.splitext(image_path)[1]  # Extract the extension
-    current_dir = os.getcwd()  # Equivalent to $(pwd) in bash
 
-    container_image_path = f"/pyhist/images/{image_name}{ext}"
+def run_pyhist_docker(image_path):
+    parent_dir = image_path.parent
+    output_root = parent_dir / "output"
+    output_root.mkdir(exist_ok=True)
 
     cmd = [
-        "podman", "run", "--rm",
-        "-v", f"{current_dir}:/pyhist/images",
+        "docker", "run", "--rm",
+        "--platform", "linux/amd64",
+        "-v", f"{parent_dir}:/pyhist/images",
         "mmunozag/pyhist",
         "--patch-size", "512",
         "--content-threshold", "0.4",
@@ -61,109 +59,73 @@ def run_pyhist_podman(image_path):
         "--save-patches",
         "--save-tilecrossed-image",
         "--info", "verbose",
-        "--output", "images/",  # Kept for consistency, though PyHIST ignores it
-        container_image_path
+        "--output", f"/pyhist/images/output",
+        f"/pyhist/images/{image_path.name}"
     ]
 
-    logging.info(f"Running Podman command: {' '.join(cmd)}")
+    logging.info("Running docker command: %s", ' '.join(cmd))
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        logging.info(f"PyHIST Podman executed successfully for {image_path}")
-        logging.debug(f"PyHIST stdout: {result.stdout}")
-        logging.debug(f"PyHIST stderr: {result.stderr}")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        logging.info("PyHIST docker executed successfully for %s", image_path)
     except subprocess.CalledProcessError as e:
-        logging.error(f"PyHIST Podman failed for {image_path}: {e.stderr}")
-        raise RuntimeError(f"PyHIST Podman processing failed: {e.stderr}") from e
+        logging.error("PyHIST docker failed for %s: %s", image_path, e.stderr)
+        raise RuntimeError("PyHIST docker processing failed: %s" % e.stderr) from e
+
+    image_folder = output_root / image_path.stem
+    expected_tile_folder = image_folder / f"{image_path.stem}_tiles"
+    return expected_tile_folder
+
 
 def process_files(input_path):
-    """Processes either a ZIP file or a single image using PyHIST Podman."""
-    temp_dir = tempfile.mkdtemp(prefix="process_")
+    temp_dir = Path.cwd() / "temp_processing"
+    temp_dir.mkdir(exist_ok=True)
+    input_path = Path(input_path).resolve()
+
     image_tile_map = {}
-    
-    try:
-        ext = os.path.splitext(input_path)[1].lower()
-        if ext in VALID_EXTENSIONS:
-            image_name = os.path.splitext(os.path.basename(input_path))[0]
-            run_pyhist_podman(input_path)
-            # Tiles are in <image_name>/<image_name>_tiles/ at the root
-            tile_dir = os.path.join(os.getcwd(), image_name, f"{image_name}_tiles")
-            logging.info(f"Checking for tiles in: {tile_dir}")
-            if os.path.exists(tile_dir):
-                tile_files = [f for f in os.listdir(tile_dir) if f.endswith('.png')]
-                logging.info(f"Found {len(tile_files)} PNG files in {tile_dir}: {tile_files}")
-                if tile_files:
-                    image_tile_map[image_name] = tile_dir
-                else:
-                    logging.warning(f"No PNG tiles found in {tile_dir}")
-            else:
-                logging.warning(f"Tile directory {tile_dir} does not exist")
-        elif ext == '.zip':
-            temp_dir, file_list = extract_zip(input_path)
-            original_dir = os.getcwd()
-            os.chdir(temp_dir)  # Change to temp_dir for ZIP processing
-            try:
-                for file_path in file_list:
-                    file_ext = os.path.splitext(file_path)[1].lower()
-                    if file_ext not in VALID_EXTENSIONS:
-                        logging.info(f"Skipping non-image file: {file_path}")
-                        continue
-                    image_name = os.path.splitext(os.path.basename(file_path))[0]
-                    run_pyhist_podman(file_path)
-                    tile_dir = os.path.join(temp_dir, image_name, f"{image_name}_tiles")
-                    logging.info(f"Checking for tiles in: {tile_dir}")
-                    if os.path.exists(tile_dir):
-                        tile_files = [f for f in os.listdir(tile_dir) if f.endswith('.png')]
-                        logging.info(f"Found {len(tile_files)} PNG files in {tile_dir}: {tile_files}")
-                        if tile_files:
-                            image_tile_map[image_name] = tile_dir
-                        else:
-                            logging.warning(f"No PNG tiles found in {tile_dir}")
-                    else:
-                        logging.warning(f"Tile directory {tile_dir} does not exist")
-            finally:
-                os.chdir(original_dir)  # Restore original directory
+    if input_path.suffix.lower() in VALID_EXTENSIONS:
+        output_dir = run_pyhist_docker(input_path)
+        tile_files = list(output_dir.glob("*.png"))
+        if tile_files:
+            image_tile_map[input_path.stem] = output_dir
         else:
-            raise ValueError(f"Unsupported input file type: {ext}. Expected .zip or {VALID_EXTENSIONS}")
-        
-        return temp_dir, image_tile_map
-    except Exception as e:
-        raise e
-    finally:
-        if ext == '.zip':
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            logging.warning("No PNG tiles found in %s", output_dir)
+    elif input_path.suffix.lower() == ".zip":
+        temp_dir, file_list = extract_zip(input_path)
+        for file_path in file_list:
+            file_ext = Path(file_path).suffix.lower()
+            if file_ext in VALID_EXTENSIONS:
+                output_dir = run_pyhist_docker(Path(file_path))
+                tile_files = list(output_dir.glob("*.png"))
+                if tile_files:
+                    image_tile_map[Path(file_path).stem] = output_dir
+                else:
+                    logging.warning("No PNG tiles found in %s", output_dir)
+    else:
+        raise ValueError(f"Unsupported input file type: {input_path.suffix}. Expected .zip or {VALID_EXTENSIONS}")
+
+    return image_tile_map
+
 
 def create_output_zip(image_tile_map, output_zip_path):
-    """Creates a ZIP file containing tiles organized by image name."""
     with zipfile.ZipFile(output_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
         for image_name, tile_dir in image_tile_map.items():
-            for root, _, files in os.walk(tile_dir):
-                for file in files:
-                    if file.endswith('.png'):
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.join(image_name, os.path.basename(file_path))
-                        zipf.write(file_path, arcname)
-                        logging.info(f"Added {file_path} to ZIP as {arcname}")
-            logging.info(f"Added tiles for {image_name} to ZIP")
-    logging.info(f"Output ZIP created: {output_zip_path}")
+            for file in tile_dir.glob("*.png"):
+                arcname = f"{image_name}/{file.name}"
+                zipf.write(file, arcname)
+    logging.info("Output ZIP created: %s", output_zip_path)
 
-def main(input_path, output_zip_path):
-    pull_podman_image()
-    temp_dir, image_tile_map = process_files(input_path)
-    try:
-        create_output_zip(image_tile_map, output_zip_path)
-        if os.path.splitext(input_path)[1].lower() in VALID_EXTENSIONS:
-            image_name = os.path.splitext(os.path.basename(input_path))[0]
-            shutil.rmtree(os.path.join(os.getcwd(), image_name), ignore_errors=True)
-    finally:
-        if os.path.splitext(input_path)[1].lower() in VALID_EXTENSIONS:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        logging.info(f"Temporary directory cleaned up: {temp_dir}")
+
+def main(input_path, output_zip):
+    pull_docker_image()
+    image_tile_map = process_files(input_path)
+    create_output_zip(image_tile_map, output_zip)
+    logging.info("Processing completed successfully.")
+
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Tile images from a ZIP file or single image using PyHIST Podman.")
-    parser.add_argument("--zip_file", required=True, help="Path to the input ZIP file or single image.")
+    parser = argparse.ArgumentParser(description="Tile images using PyHIST docker.")
+    parser.add_argument("--input", required=True, help="Path to the input ZIP file or single image.")
     parser.add_argument("--output_zip", required=True, help="Path to the output ZIP file with tiles.")
-    
     args = parser.parse_args()
-    main(args.zip_file, args.output_zip)
+    main(args.input, args.output_zip)

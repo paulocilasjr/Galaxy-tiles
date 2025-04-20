@@ -1,10 +1,10 @@
-import os
+import argparse
 import zipfile
-import tempfile
 import subprocess
-import shutil
 from pathlib import Path
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
 logging.basicConfig(
     filename="tile_processing.log",
@@ -14,29 +14,6 @@ logging.basicConfig(
 )
 
 VALID_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.svs', '.dat'}
-
-
-def extract_zip(zip_file):
-    temp_dir = tempfile.mkdtemp(prefix="zip_extract_")
-    try:
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-            file_list = [str(Path(temp_dir) / f) for f in zip_ref.namelist()]
-        logging.info("ZIP file extracted to: %s", temp_dir)
-        return temp_dir, file_list
-    except zipfile.BadZipFile as exc:
-        raise RuntimeError("Invalid ZIP file.") from exc
-
-
-def pull_docker_image():
-    try:
-        subprocess.run(["docker", "pull", "mmunozag/pyhist"],
-                       check=True, capture_output=True, text=True)
-        logging.info("Pulled docker image: mmunozag/pyhist")
-    except subprocess.CalledProcessError as e:
-        logging.error("Failed to pull docker image: %s", e.stderr)
-        raise RuntimeError("Failed to pull mmunozag/pyhist: %s" % e.stderr) from e
-
 
 def run_pyhist_docker(image_path):
     parent_dir = image_path.parent
@@ -71,61 +48,76 @@ def run_pyhist_docker(image_path):
         logging.error("PyHIST docker failed for %s: %s", image_path, e.stderr)
         raise RuntimeError("PyHIST docker processing failed: %s" % e.stderr) from e
 
-    image_folder = output_root / image_path.stem
+    image_folder = parent_dir / "output" / image_path.stem
     expected_tile_folder = image_folder / f"{image_path.stem}_tiles"
     return expected_tile_folder
 
 
-def process_files(input_path):
-    temp_dir = Path.cwd() / "temp_processing"
-    temp_dir.mkdir(exist_ok=True)
-    input_path = Path(input_path).resolve()
+def append_to_zip(output_zip_path, original_name, tile_dir):
+    # Strip extension from original name
+    original_base = Path(original_name).stem
 
-    image_tile_map = {}
-    if input_path.suffix.lower() in VALID_EXTENSIONS:
-        output_dir = run_pyhist_docker(input_path)
-        tile_files = list(output_dir.glob("*.png"))
-        if tile_files:
-            image_tile_map[input_path.stem] = output_dir
+    with zipfile.ZipFile(output_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as zipf:
+        for file in tile_dir.glob("*.png"):
+            file_stem = file.stem  # Without .png extension
+
+            # Get last numeric part as tile number
+            parts = file_stem.split('_')
+            tile_number = next((p for p in reversed(parts) if p.isdigit()), '0000')
+
+            new_name = f"{original_base}_{tile_number}.png"
+            arcname = f"{original_base}/{new_name}"
+            zipf.write(file, arcname)
+
+    logging.info("Appended tiles from %s to %s", original_base, output_zip_path)
+
+
+def process_image(args):
+    image_path_str, original_name, output_zip = args
+    input_path = Path(image_path_str).resolve()
+    output_zip_path = Path(output_zip).resolve()
+
+    if not input_path.exists() or input_path.suffix.lower() not in VALID_EXTENSIONS:
+        logging.warning("Skipping invalid or unsupported file: %s", input_path)
+        return
+
+    try:
+        tile_dir = run_pyhist_docker(input_path)
+        if tile_dir.exists():
+            append_to_zip(output_zip_path, original_name, tile_dir)
         else:
-            logging.warning("No PNG tiles found in %s", output_dir)
-    elif input_path.suffix.lower() == ".zip":
-        temp_dir, file_list = extract_zip(input_path)
-        for file_path in file_list:
-            file_ext = Path(file_path).suffix.lower()
-            if file_ext in VALID_EXTENSIONS:
-                output_dir = run_pyhist_docker(Path(file_path))
-                tile_files = list(output_dir.glob("*.png"))
-                if tile_files:
-                    image_tile_map[Path(file_path).stem] = output_dir
-                else:
-                    logging.warning("No PNG tiles found in %s", output_dir)
-    else:
-        raise ValueError(f"Unsupported input file type: {input_path.suffix}. Expected .zip or {VALID_EXTENSIONS}")
+            logging.warning("No tiles found for: %s", input_path)
+    except Exception as e:
+        logging.error("Failed processing %s: %s", input_path, str(e))
 
-    return image_tile_map
+def main(input_path_pairs, output_zip):
+    max_workers = min(4, os.cpu_count() or 1)  # Conservative cap for Galaxy
+    args_list = [(img, name, output_zip) for img, name in input_path_pairs]
 
-
-def create_output_zip(image_tile_map, output_zip_path):
-    with zipfile.ZipFile(output_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
-        for image_name, tile_dir in image_tile_map.items():
-            for file in tile_dir.glob("*.png"):
-                arcname = f"{image_name}/{file.name}"
-                zipf.write(file, arcname)
-    logging.info("Output ZIP created: %s", output_zip_path)
-
-
-def main(input_path, output_zip):
-    pull_docker_image()
-    image_tile_map = process_files(input_path)
-    create_output_zip(image_tile_map, output_zip)
-    logging.info("Processing completed successfully.")
-
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_image, args) for args in args_list]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error("Unhandled error in parallel worker: %s", str(e))
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Tile images using PyHIST docker.")
-    parser.add_argument("--input", required=True, help="Path to the input ZIP file or single image.")
-    parser.add_argument("--output_zip", required=True, help="Path to the output ZIP file with tiles.")
+    parser = argparse.ArgumentParser(description="Tile images using PyHIST docker and zip the results.")
+
+    parser.add_argument(
+        "--input", dest="input_paths", action="append", required=True,
+        help="Paths to one or more input images."
+    )
+    parser.add_argument(
+        "--original_name", dest="original_names", action="append", required=True,
+        help="Original names of the input images."
+    )
+    parser.add_argument(
+        "--output_zip", required=True,
+        help="Path to the output ZIP file with tiles."
+    )
+
     args = parser.parse_args()
-    main(args.input, args.output_zip)
+    main(list(zip(args.input_paths, args.original_names)), args.output_zip)
+

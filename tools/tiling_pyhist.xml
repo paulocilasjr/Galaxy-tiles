@@ -21,7 +21,7 @@
     </inputs>
 
     <outputs>
-        <data name="output_zip.zip" format="zip" label="Image Tiles (zip)" />
+        <data name="output_zip" format="zip" label="Image Tiles (zip)" />
     </outputs>
 
     <help><![CDATA[

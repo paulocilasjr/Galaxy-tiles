@@ -2,9 +2,7 @@
     <description>Tile pathology images using PyHIST in parallel</description>
 
     <requirements>
-        <requirements>
-            <container type="docker">mmunozag/pyhist:latest</container>
-        </requirements>
+        <container type="docker">mmunozag/pyhist:latest</container>
     </requirements>
 
     <command><![CDATA[
